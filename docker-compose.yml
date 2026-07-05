@@ -1,0 +1,68 @@
+services:
+  api:
+    build: .
+    container_name: payment_api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    depends_on:
+      - postgres
+      - rabbitmq
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/payment_db
+      CELERY_BROKER_URL: amqp://guest:guest@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: db+postgresql://postgres:postgres@postgres:5432/payment_db
+
+  celery_worker:
+    build: .
+    container_name: celery_worker
+    command: celery -A app.celery_app worker --loglevel=info
+    volumes:
+      - .:/app
+    depends_on:
+      - postgres
+      - rabbitmq
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/payment_db
+      CELERY_BROKER_URL: amqp://guest:guest@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: db+postgresql://postgres:postgres@postgres:5432/payment_db
+
+  celery_beat:
+    build: .
+    container_name: celery_beat
+    command: celery -A app.celery_app beat --loglevel=info
+    volumes:
+      - .:/app
+    depends_on:
+      - postgres
+      - rabbitmq
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/payment_db
+      CELERY_BROKER_URL: amqp://guest:guest@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: db+postgresql://postgres:postgres@postgres:5432/payment_db
+
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: payment_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    restart: always
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+volumes:
+  postgres_data:
