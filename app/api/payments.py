@@ -36,3 +36,9 @@ def list_payments(status: PaymentStatus| None = None, db: Session = Depends(get_
         q = q.filter({Payment.status == status})
     return q.order_by(Payment.created_at.desc()).limit(100).all()
 
+@router.get("/payment_id")
+def get_payment(payment_id: UUID, db: Session = Depends(get_db)):
+    p = db.get(Payment, payment_id)
+    if not p:
+        raise HTTPException(404, "payment not found")
+    return  {**PaymentOut.model_validate(p).model_dump(),"events": [{"type": e.event_type, "at": e.created_at,"detail": e.detail} for e in p.events]}
