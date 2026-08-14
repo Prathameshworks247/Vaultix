@@ -7,7 +7,7 @@ from uuid import UUID
 SUPPORTED = {"INR", "USD", "EUR"}
 
 class PaymentCreate(BaseModel):
-    merchant_id: str
+    merchant_id: UUID
     amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
     currency: str = "INR"
     
@@ -21,7 +21,7 @@ class PaymentCreate(BaseModel):
     
 class PaymentOut(BaseModel):
     id: UUID
-    merchant_id: str
+    merchant_id: UUID
     amount: Decimal
     currency:str
     status: str

@@ -7,3 +7,4 @@ celery
 kombu
 pydantic
 python-dotenv
+slowapi
