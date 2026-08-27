@@ -37,3 +37,4 @@ celerybeat.pid
 
 # Docker
 docker-compose.override.yml
+INTERVIEW_NOTES.md
