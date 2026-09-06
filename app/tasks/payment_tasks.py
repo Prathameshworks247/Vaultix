@@ -1,7 +1,7 @@
 import random
 import time
 
-from celery import chain
+from celery import chain, group
 
 from app.celery_app import app
 from app.db.session import SessionLocal
@@ -67,9 +67,11 @@ def fraud_check(payment_id: str):
 
 
 def payment_pipeline(payment_id: str):
+    # send_receipt and notify_merchant are independent side effects of a settled payment -
+    # a failed/slow receipt email must not gate (or be gated by) the merchant notification,
+    # so they fan out as a group rather than chaining linearly.
     return chain(
         process_payment.s(payment_id),
         fraud_check.s(),
-        send_receipt.s(),
-        notify_merchant.s(),
+        group(send_receipt.s(), notify_merchant.s()),
     ).apply_async()
