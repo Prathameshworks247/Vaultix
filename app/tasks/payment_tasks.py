@@ -6,6 +6,7 @@ from celery import chain, group
 from app.celery_app import app
 from app.db.session import SessionLocal
 from app.models.payments import Payment, PaymentEvent, PaymentStatus
+from app.services import fraud_service
 from app.tasks.email_tasks import send_receipt, notify_merchant
 
 OUTCOMES = ["success", "failure", "timeout"]
@@ -61,9 +62,18 @@ def process_payment(self, payment_id: str):
 
 @app.task(name="tasks.fraud_check")
 def fraud_check(payment_id: str):
-    # TODO(Phase 5): amount threshold + velocity checks
-    print(f"[stub] fraud_check for payment {payment_id}")
-    return payment_id
+    db = SessionLocal()
+    try:
+        payment = db.get(Payment, payment_id)
+        flags = fraud_service.evaluate(db, payment)
+        if flags:
+            # Annotate only - never blocks or changes payment.status. The payment already
+            # settled in process_payment; this just leaves a record for a human to review later.
+            db.add(PaymentEvent(payment_id=payment.id, event_type="FRAUD_FLAGGED", detail={"flags": flags}))
+            db.commit()
+        return payment_id
+    finally:
+        db.close()
 
 
 def payment_pipeline(payment_id: str):
