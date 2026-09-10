@@ -1,13 +1,17 @@
+import logging
 import random
 import time
 
 from celery import chain, group
 
 from app.celery_app import app
+from app.core.logging import bind_payment_id
 from app.db.session import SessionLocal
 from app.models.payments import Payment, PaymentEvent, PaymentStatus
 from app.services import fraud_service
 from app.tasks.email_tasks import send_receipt, notify_merchant
+
+logger = logging.getLogger(__name__)
 
 OUTCOMES = ["success", "failure", "timeout"]
 WEIGHTS = [70, 20, 10]
@@ -16,64 +20,73 @@ WEIGHTS = [70, 20, 10]
 @app.task(name="tasks.process_payment", bind=True, max_retries=3)
 def process_payment(self, payment_id: str):
     db = SessionLocal()
-    try:
-        payment = db.get(Payment, payment_id)
+    with bind_payment_id(payment_id):
+        try:
+            payment = db.get(Payment, payment_id)
 
-        payment.status = PaymentStatus.PROCESSING
-        db.add(PaymentEvent(
-            payment_id=payment.id,
-            event_type="PROCESSING",
-            detail={"attempt": self.request.retries + 1},
-        ))
-        db.commit()
-
-        time.sleep(random.uniform(5, 15))
-        outcome = random.choices(OUTCOMES, weights=WEIGHTS)[0]
-
-        if outcome == "success":
-            payment.status = PaymentStatus.SUCCEEDED
-            db.add(PaymentEvent(payment_id=payment.id, event_type="SUCCEEDED"))
-            db.commit()
-            return payment_id
-
-        if outcome == "timeout":
+            payment.status = PaymentStatus.PROCESSING
+            attempt = self.request.retries + 1
             db.add(PaymentEvent(
                 payment_id=payment.id,
-                event_type="TIMEOUT",
-                detail={"attempt": self.request.retries + 1},
+                event_type="PROCESSING",
+                detail={"attempt": attempt},
             ))
             db.commit()
-            raise self.retry(countdown=2 ** self.request.retries)
+            logger.info(f"processing payment (attempt {attempt}, amount={payment.amount})")
 
-        # outcome == "failure"
-        payment.status = PaymentStatus.FAILED
-        db.add(PaymentEvent(payment_id=payment.id, event_type="FAILED", detail={"reason": "simulated_failure"}))
-        db.commit()
-        raise RuntimeError(f"payment {payment_id} failed")
+            time.sleep(random.uniform(5, 15))
+            outcome = random.choices(OUTCOMES, weights=WEIGHTS)[0]
 
-    except self.MaxRetriesExceededError:
-        payment.status = PaymentStatus.FAILED
-        db.add(PaymentEvent(payment_id=payment.id, event_type="FAILED", detail={"reason": "timeout_exhausted"}))
-        db.commit()
-        raise
-    finally:
-        db.close()
+            if outcome == "success":
+                payment.status = PaymentStatus.SUCCEEDED
+                db.add(PaymentEvent(payment_id=payment.id, event_type="SUCCEEDED"))
+                db.commit()
+                logger.info("payment succeeded")
+                return payment_id
+
+            if outcome == "timeout":
+                db.add(PaymentEvent(
+                    payment_id=payment.id,
+                    event_type="TIMEOUT",
+                    detail={"attempt": attempt},
+                ))
+                db.commit()
+                logger.warning(f"payment attempt {attempt} timed out, retrying")
+                raise self.retry(countdown=2 ** self.request.retries)
+
+            # outcome == "failure"
+            payment.status = PaymentStatus.FAILED
+            db.add(PaymentEvent(payment_id=payment.id, event_type="FAILED", detail={"reason": "simulated_failure"}))
+            db.commit()
+            logger.warning("payment failed (simulated_failure)")
+            raise RuntimeError(f"payment {payment_id} failed")
+
+        except self.MaxRetriesExceededError:
+            payment.status = PaymentStatus.FAILED
+            db.add(PaymentEvent(payment_id=payment.id, event_type="FAILED", detail={"reason": "timeout_exhausted"}))
+            db.commit()
+            logger.error("payment failed: retries exhausted after repeated timeouts")
+            raise
+        finally:
+            db.close()
 
 
 @app.task(name="tasks.fraud_check")
 def fraud_check(payment_id: str):
     db = SessionLocal()
-    try:
-        payment = db.get(Payment, payment_id)
-        flags = fraud_service.evaluate(db, payment)
-        if flags:
-            # Annotate only - never blocks or changes payment.status. The payment already
-            # settled in process_payment; this just leaves a record for a human to review later.
-            db.add(PaymentEvent(payment_id=payment.id, event_type="FRAUD_FLAGGED", detail={"flags": flags}))
-            db.commit()
-        return payment_id
-    finally:
-        db.close()
+    with bind_payment_id(payment_id):
+        try:
+            payment = db.get(Payment, payment_id)
+            flags = fraud_service.evaluate(db, payment)
+            if flags:
+                # Annotate only - never blocks or changes payment.status. The payment already
+                # settled in process_payment; this just leaves a record for a human to review later.
+                db.add(PaymentEvent(payment_id=payment.id, event_type="FRAUD_FLAGGED", detail={"flags": flags}))
+                db.commit()
+                logger.warning(f"fraud check flagged payment: {flags}")
+            return payment_id
+        finally:
+            db.close()
 
 
 def payment_pipeline(payment_id: str):

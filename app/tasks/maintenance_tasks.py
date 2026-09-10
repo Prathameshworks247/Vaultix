@@ -1,10 +1,14 @@
+import logging
 import os
 from datetime import datetime, timedelta
 
 from app.celery_app import app
+from app.core.logging import bind_payment_id
 from app.db.session import SessionLocal
 from app.models.payments import Payment, PaymentEvent, PaymentStatus
 from app.tasks.email_tasks import notify_merchant
+
+logger = logging.getLogger(__name__)
 
 # How long a payment may sit in PROCESSING before we consider it stuck. process_payment's
 # own retry/backoff loop settles well within a minute (sleep 5-15s + up to 3 retries), so
@@ -49,11 +53,15 @@ def reap_stuck_payments():
                 },
             ))
             db.commit()
+            with bind_payment_id(str(payment.id)):
+                logger.warning(f"reaped stuck payment (idle past {STUCK_PAYMENT_TIMEOUT_MINUTES}m in PROCESSING)")
             reaped.append(str(payment.id))
 
         for payment_id in reaped:
             notify_merchant.delay(payment_id)
 
+        if reaped:
+            logger.info(f"reap_stuck_payments: reaped {len(reaped)} payment(s)")
         return reaped
     finally:
         db.close()

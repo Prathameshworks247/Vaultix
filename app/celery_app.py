@@ -1,7 +1,20 @@
 import os
 from celery import Celery
 from celery.schedules import crontab
+from celery.signals import setup_logging
 from kombu import Queue
+
+from app.core.logging import configure_logging
+
+
+@setup_logging.connect
+def _configure_worker_logging(**kwargs):
+    # Take over logging setup entirely instead of letting Celery configure its own
+    # handlers/formatters - keeps worker/beat log output in the same JSON-lines format as
+    # the API process.
+    configure_logging()
+
+
 app = Celery(
     "payment_gateway",
     broker=os.environ.get("CELERY_BROKER_URL", "amqp://guest:guest@localhost:5672//"),

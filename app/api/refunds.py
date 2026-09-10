@@ -1,12 +1,16 @@
+import logging
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.core.logging import bind_payment_id
 from app.db.session import get_db
 from app.models.payments import Payment, PaymentEvent, PaymentStatus, Refund
 from app.schemas.refunds import RefundCreate, RefundOut
 from app.tasks.refund_tasks import process_refund
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/payments", tags=["refunds"])
 
@@ -36,5 +40,7 @@ def create_refund(payment_id: UUID, body: RefundCreate, db: Session = Depends(ge
     ))
     db.commit()
 
+    with bind_payment_id(str(payment.id)):
+        logger.info(f"refund {refund_id} requested: amount={amount}")
     process_refund.delay(str(refund_id))
     return refund

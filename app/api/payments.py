@@ -1,12 +1,16 @@
+import logging
 from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.core.limiter import limiter
+from app.core.logging import bind_payment_id
 from app.db.session import get_db
 from app.models.payments import Merchant, Payment, PaymentEvent, PaymentStatus
 from app.schemas.payments import PaymentCreate, PaymentOut
 from app.tasks.payment_tasks import payment_pipeline
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
@@ -42,6 +46,8 @@ def create_payment(
         if idempotency_key:
             return db.query(Payment).filter_by(idempotency_key=idempotency_key).one()
         raise
+    with bind_payment_id(str(payment.id)):
+        logger.info(f"payment created: amount={payment.amount} {payment.currency} merchant={payment.merchant_id}")
     payment_pipeline(str(payment.id))
     return payment
 
