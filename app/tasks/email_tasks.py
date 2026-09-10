@@ -38,6 +38,20 @@ def send_receipt(self, payment_id: str):
         payment = db.get(Payment, payment_id)
 
         if random.random() < RECEIPT_FAILURE_RATE:
+            # self.retry(..., exc=exc) re-raises exc itself (not MaxRetriesExceededError)
+            # once retries are exhausted, so the exhaustion check has to happen here rather
+            # than in an `except self.MaxRetriesExceededError` around this call.
+            if self.request.retries >= self.max_retries:
+                # The payment already SUCCEEDED - a missing receipt is a CS issue, not a
+                # settlement issue. Log it and stop; don't let this poison the payment or
+                # its sibling task.
+                db.add(PaymentEvent(
+                    payment_id=payment_id,
+                    event_type="RECEIPT_FAILED",
+                    detail={"reason": "smtp_unavailable"},
+                ))
+                db.commit()
+                return payment_id
             raise self.retry(
                 countdown=2 ** self.request.retries,
                 exc=ConnectionError("simulated SMTP failure"),
@@ -46,17 +60,6 @@ def send_receipt(self, payment_id: str):
         # Simulate sending a receipt email (swap for real SMTP / Mailhog later).
         print(f"[email] receipt sent for payment {payment_id} amount={payment.amount} {payment.currency}")
         db.add(PaymentEvent(payment_id=payment.id, event_type="RECEIPT_SENT"))
-        db.commit()
-        return payment_id
-
-    except self.MaxRetriesExceededError:
-        # The payment already SUCCEEDED - a missing receipt is a CS issue, not a settlement
-        # issue. Log it and stop; don't let this poison the payment or its sibling task.
-        db.add(PaymentEvent(
-            payment_id=payment_id,
-            event_type="RECEIPT_FAILED",
-            detail={"reason": "smtp_unavailable"},
-        ))
         db.commit()
         return payment_id
     finally:
