@@ -1,5 +1,6 @@
-import os 
+import os
 from celery import Celery
+from celery.schedules import crontab
 from kombu import Queue
 app = Celery(
     "payment_gateway",
@@ -9,6 +10,7 @@ app = Celery(
         "app.tasks.payment_tasks",
         "app.tasks.email_tasks",
         "app.tasks.refund_tasks",
+        "app.tasks.maintenance_tasks",
     ],
 )
 
@@ -27,6 +29,16 @@ app.conf.task_routes = {
     "tasks.send_receipt": {"queue": "email_queue"},
     "tasks.notify_merchant": {"queue": "notification_queue"},
     "tasks.process_refund": {"queue": "refund_queue"},
+    "tasks.reap_stuck_payments": {"queue": "payment_queue"},
+}
+
+# Nightly sweep for payments stuck in PROCESSING (worker died, task message lost, etc.) -
+# see app.tasks.maintenance_tasks.reap_stuck_payments.
+app.conf.beat_schedule = {
+    "reap-stuck-payments-nightly": {
+        "task": "tasks.reap_stuck_payments",
+        "schedule": crontab(hour=2, minute=0),
+    },
 }
 
 @app.task(name="tasks.hello_world")
