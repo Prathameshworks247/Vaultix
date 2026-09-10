@@ -17,6 +17,8 @@ class Merchant(Base):
     __tablename__ = "merchants"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String, nullable=False)
+    webhook_url = Column(String, nullable=True)
+    webhook_secret = Column(String, nullable=True)  # HMAC key used to sign outbound webhook payloads
     created_at = Column(DateTime, default=datetime.utcnow)
     payments = relationship("Payment", back_populates="merchant")
 

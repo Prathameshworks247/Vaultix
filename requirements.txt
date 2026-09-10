@@ -8,3 +8,4 @@ kombu
 pydantic
 python-dotenv
 slowapi
+requests

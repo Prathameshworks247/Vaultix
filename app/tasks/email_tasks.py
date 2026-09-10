@@ -1,8 +1,23 @@
+import hashlib
+import hmac
 import random
+import time
+
+import requests
 
 from app.celery_app import app
 from app.db.session import SessionLocal
 from app.models.payments import Payment, PaymentEvent
+
+WEBHOOK_TIMEOUT_SECONDS = 5
+
+
+def _sign(secret: str, body: bytes, timestamp: str) -> str:
+    # Timestamp is part of the signed payload (not just sent alongside it) so a captured
+    # request can't be replayed indefinitely - the receiver checks both the signature and
+    # that the timestamp is recent.
+    mac = hmac.new(secret.encode(), f"{timestamp}.".encode() + body, hashlib.sha256)
+    return mac.hexdigest()
 
 RECEIPT_FAILURE_RATE = 0.15
 
@@ -48,8 +63,8 @@ def send_receipt(self, payment_id: str):
         db.close()
 
 
-@app.task(name="tasks.notify_merchant")
-def notify_merchant(payment_id: str):
+@app.task(name="tasks.notify_merchant", bind=True, max_retries=3)
+def notify_merchant(self, payment_id: str):
     db = SessionLocal()
     try:
         already_notified = (
@@ -61,9 +76,46 @@ def notify_merchant(payment_id: str):
             return payment_id
 
         payment = db.get(Payment, payment_id)
-        # Simulate notifying the merchant (Phase 9 turns this into a real webhook POST).
-        print(f"[notify] merchant {payment.merchant_id} notified: payment {payment_id} status={payment.status}")
-        db.add(PaymentEvent(payment_id=payment.id, event_type="MERCHANT_NOTIFIED"))
+        merchant = payment.merchant
+
+        if not merchant.webhook_url:
+            # No webhook registered for this merchant - fall back to the simulated log line.
+            print(f"[notify] merchant {merchant.id} notified: payment {payment_id} status={payment.status}")
+            db.add(PaymentEvent(payment_id=payment.id, event_type="MERCHANT_NOTIFIED"))
+            db.commit()
+            return payment_id
+
+        body = f'{{"payment_id": "{payment_id}", "status": "{payment.status.value}"}}'.encode()
+        headers = {"Content-Type": "application/json"}
+        if merchant.webhook_secret:
+            timestamp = str(int(time.time()))
+            headers["X-Webhook-Timestamp"] = timestamp
+            headers["X-Webhook-Signature"] = _sign(merchant.webhook_secret, body, timestamp)
+
+        try:
+            resp = requests.post(merchant.webhook_url, data=body, headers=headers, timeout=WEBHOOK_TIMEOUT_SECONDS)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            # self.retry(..., exc=exc) re-raises exc itself (not MaxRetriesExceededError)
+            # once retries are exhausted, so the exhaustion check has to happen here rather
+            # than in an `except self.MaxRetriesExceededError` around this call.
+            if self.request.retries >= self.max_retries:
+                # Payment already settled - a merchant whose endpoint is down is their
+                # problem to fix, not ours to keep retrying forever. Log it and stop.
+                db.add(PaymentEvent(
+                    payment_id=payment.id,
+                    event_type="WEBHOOK_FAILED",
+                    detail={"url": merchant.webhook_url, "reason": str(exc)},
+                ))
+                db.commit()
+                return payment_id
+            raise self.retry(countdown=2 ** self.request.retries, exc=exc)
+
+        db.add(PaymentEvent(
+            payment_id=payment.id,
+            event_type="MERCHANT_NOTIFIED",
+            detail={"webhook": True, "status_code": resp.status_code},
+        ))
         db.commit()
         return payment_id
     finally:
