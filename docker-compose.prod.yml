@@ -1,0 +1,22 @@
+# Production overlay - layer on top of the base file:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# Drops the dev conveniences (live-reload, bind-mounted source) in favor of what changed
+# actually shipping in the image, and adds restart policies so a container that dies comes
+# back on its own.
+services:
+  api:
+    volumes: []
+    restart: unless-stopped
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4"
+
+  celery_worker:
+    volumes: []
+    restart: unless-stopped
+
+  celery_beat:
+    volumes: []
+    restart: unless-stopped
+
+  flower:
+    restart: unless-stopped

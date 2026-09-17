@@ -1,19 +1,35 @@
+x-env: &env
+  DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-payment_db}
+  CELERY_BROKER_URL: amqp://guest:guest@rabbitmq:5672//
+  CELERY_RESULT_BACKEND: db+postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-payment_db}
+  ADMIN_API_KEY: ${ADMIN_API_KEY:-admin-dev-key}
+  FRAUD_AMOUNT_THRESHOLD: ${FRAUD_AMOUNT_THRESHOLD:-50000}
+  FRAUD_VELOCITY_LIMIT: ${FRAUD_VELOCITY_LIMIT:-10}
+  STUCK_PAYMENT_TIMEOUT_MINUTES: ${STUCK_PAYMENT_TIMEOUT_MINUTES:-30}
+
 services:
   api:
     build: .
     container_name: payment_api
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    # Migrate on every start so a fresh deploy (or a new migration landing) never needs a
+    # separate manual `alembic upgrade head` step.
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
     ports:
       - "8000:8000"
     volumes:
       - .:/app
     depends_on:
-      - postgres
-      - rabbitmq
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/payment_db
-      CELERY_BROKER_URL: amqp://guest:guest@rabbitmq:5672//
-      CELERY_RESULT_BACKEND: db+postgresql://postgres:postgres@postgres:5432/payment_db
+      <<: *env
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   celery_worker:
     build: .
@@ -22,12 +38,12 @@ services:
     volumes:
       - .:/app
     depends_on:
-      - postgres
-      - rabbitmq
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/payment_db
-      CELERY_BROKER_URL: amqp://guest:guest@rabbitmq:5672//
-      CELERY_RESULT_BACKEND: db+postgresql://postgres:postgres@postgres:5432/payment_db
+      <<: *env
 
   celery_beat:
     build: .
@@ -36,25 +52,30 @@ services:
     volumes:
       - .:/app
     depends_on:
-      - postgres
-      - rabbitmq
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/payment_db
-      CELERY_BROKER_URL: amqp://guest:guest@rabbitmq:5672//
-      CELERY_RESULT_BACKEND: db+postgresql://postgres:postgres@postgres:5432/payment_db
+      <<: *env
 
   postgres:
     image: postgres:16
     container_name: postgres
     restart: always
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: payment_db
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-payment_db}
     ports:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   rabbitmq:
     image: rabbitmq:3-management
@@ -63,6 +84,11 @@ services:
     ports:
       - "5672:5672"
       - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   flower:
     image: mher/flower:2.0
@@ -71,7 +97,8 @@ services:
     ports:
       - "5555:5555"
     depends_on:
-      - rabbitmq
+      rabbitmq:
+        condition: service_healthy
 
 volumes:
   postgres_data:
