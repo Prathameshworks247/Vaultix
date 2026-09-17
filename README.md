@@ -30,9 +30,9 @@ Payment processing is slow, unreliable, and unforgiving of mistakes. A gateway c
 | 🐇 **Queue isolation** | Dedicated `payment`, `email`, `refund`, and `notification` queues — an email flood can never starve payment processing |
 | ⛓️ **Celery chains** | `process_payment → fraud_check → send_receipt → notify_merchant` pipeline via Celery canvas |
 | 🕵️ **Fraud detection** | Amount-threshold rule (> ₹50,000) + per-merchant velocity rule (> 10 payments/min) |
-| ♻️ **Retries + backoff** | Simulated timeouts retry at 2s → 4s → 8s, capped at 3 attempts, then marked `FAILED` |
+| ♻️ **Retries + backoff** | Simulated timeouts retry at 1s → 2s → 4s, capped at 3 attempts, then marked `FAILED` |
 | 💸 **Safe refunds** | Row-level locking (`SELECT ... FOR UPDATE`) + state guards prevent double refunds |
-| 🪝 **Signed webhooks** | HMAC-SHA256 payload signatures with exponential-backoff redelivery (up to 5 attempts) |
+| 🪝 **Signed webhooks** | HMAC-SHA256 payload signatures with exponential-backoff redelivery (up to 3 attempts) |
 | ⏰ **Reconciliation** | Celery Beat nightly job sweeps payments stuck in `PROCESSING` and fails them cleanly |
 | 📊 **Observability** | `/admin/stats` metrics, Celery worker introspection, structured JSON logs correlated by `payment_id`, optional Flower dashboard |
 | 🚦 **Rate limiting** | Token-bucket limiting (100 req/min per client) via slowapi |
@@ -53,8 +53,8 @@ Client ──HTTP──▶ FastAPI (api)
                   payment_queue           ├─ fraud_check
                   email_queue             ├─ send_receipt / notify_merchant
                   refund_queue            ├─ process_refund
-                  notification_queue      └─ deliver_webhook
-               Celery Beat ──▶ scheduled cleanup of stuck payments
+                  notification_queue      └─ notify_merchant (webhook if registered, else log)
+               Celery Beat ──▶ nightly sweep of payments stuck in PROCESSING
 ```
 
 **Design decisions worth noting:**
@@ -72,19 +72,21 @@ Client ──HTTP──▶ FastAPI (api)
 git clone https://github.com/Prathameshworks247/Vaultix.git
 cd Vaultix
 
-cp .env.example .env          # defaults work out of the box
 docker compose up --build
 ```
 
-This starts five services:
+Env vars for the containers are set directly in `docker-compose.yml`, so no `.env` is needed for the Docker path — copy `.env.example` to `.env` only if you want to point local (non-Docker) tooling like Alembic or the tests at the containers' Postgres.
+
+This starts six services:
 
 | Service | Purpose | Port |
 |---|---|---|
 | `api` | FastAPI application | `8000` |
-| `postgres` | Source of truth (payments, events, refunds) | `5432` |
+| `postgres` | Source of truth (payments, events, refunds) | `5433` (host) → `5432` |
 | `rabbitmq` | Message broker (+ management UI) | `5672` / `15672` |
 | `celery_worker` | Consumes all four task queues | — |
 | `celery_beat` | Scheduled reconciliation jobs | — |
+| `flower` | Visual Celery dashboard | `5555` |
 
 Then run migrations:
 
@@ -92,8 +94,16 @@ Then run migrations:
 docker compose exec api alembic upgrade head
 ```
 
+Vaultix has no merchant-onboarding endpoint yet (see Roadmap), so seed one directly:
+
+```bash
+docker compose exec postgres psql -U postgres -d payment_db \
+  -c "INSERT INTO merchants (id, name) VALUES (gen_random_uuid(), 'Test Merchant') RETURNING id;"
+```
+
 - API docs (Swagger): http://localhost:8000/docs
 - RabbitMQ UI: http://localhost:15672 (`guest` / `guest`)
+- Flower: http://localhost:5555
 
 ## API Walkthrough
 
@@ -103,13 +113,13 @@ docker compose exec api alembic upgrade head
 curl -X POST http://localhost:8000/payments \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: order-42-attempt-1" \
-  -d '{"merchant_id": "m_123", "amount": "499.00", "currency": "INR"}'
+  -d '{"merchant_id": "<merchant-uuid-from-setup>", "amount": "499.00", "currency": "INR"}'
 ```
 
 ```json
 {
   "id": "8f14e45f-ceea-467f-a9b2-7c3d0011a3c1",
-  "merchant_id": "m_123",
+  "merchant_id": "<merchant-uuid-from-setup>",
   "amount": "499.00",
   "currency": "INR",
   "status": "PENDING",
@@ -144,25 +154,31 @@ Processing is simulated: each payment takes 5–15s and resolves **70% success /
 ### 3. Refund it
 
 ```bash
-curl -X POST http://localhost:8000/payments/{id}/refund
-# → 202 Accepted  {"refund_id": "...", "status": "PENDING"}
+curl -X POST http://localhost:8000/payments/{id}/refund \
+  -H "Content-Type: application/json" -d '{}'
+# → 202 Accepted  {"id": "...", "payment_id": "...", "amount": "499.00", "status": "PENDING", ...}
 ```
 
-Refunding a non-succeeded or already-refunded payment returns `409 Conflict`.
+Omit `amount` for a full refund, or pass `{"amount": "100.00"}` for a partial one. Refunding a non-succeeded or already-refunded payment returns `409 Conflict`; only one active refund per payment is allowed.
 
 ### 4. Register a webhook
 
 ```bash
-curl -X PUT "http://localhost:8000/webhooks/m_123?url=https://merchant.example/hooks&secret=s3cret"
+curl -X PUT http://localhost:8000/merchants/{merchant_id}/webhook \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://merchant.example/hooks", "secret": "s3cret"}'
 ```
 
-On settlement, Vaultix POSTs `{payment_id, status}` to your URL with an `X-Gateway-Signature` header (HMAC-SHA256 of the raw body). Verify it server-side with `hmac.compare_digest`.
+On settlement, Vaultix POSTs `{payment_id, status}` to your URL with `X-Webhook-Signature` (HMAC-SHA256 of `"<timestamp>.<body>"`) and `X-Webhook-Timestamp` headers. Verify it server-side with `hmac.compare_digest`. No webhook registered → falls back to a log line instead.
 
 ### 5. Check system health
 
 ```bash
 curl http://localhost:8000/admin/stats
-# {"total": 128, "by_status": {...}, "success_rate": 0.71, "failure_rate": 0.22}
+# {"payments": {"total": 128, "by_status": {...}, "success_rate": 0.71, "failure_rate": 0.22}, "refunds": {...}}
+
+curl http://localhost:8000/admin/queues    # per-queue backlog, read straight off the broker
+curl http://localhost:8000/admin/workers   # live worker roster via Celery inspect
 ```
 
 ## Project Structure
@@ -171,41 +187,45 @@ curl http://localhost:8000/admin/stats
 vaultix/
 ├── app/
 │   ├── api/            # HTTP layer: payments, refunds, webhooks, admin
-│   ├── models/         # SQLAlchemy: Payment, PaymentEvent, Refund, WebhookEndpoint
+│   ├── core/            # Rate limiter, structured logging (JSON, correlated by payment_id)
+│   ├── models/         # SQLAlchemy: Merchant (+ webhook_url/secret), Payment, PaymentEvent, Refund
 │   ├── schemas/        # Pydantic request/response contracts
 │   ├── services/       # Pure business logic (fraud rules, etc.)
-│   ├── tasks/          # Celery app, queues, routing, all task definitions
+│   ├── tasks/          # Celery app, queues, routing, all task definitions (incl. the Beat reaper)
 │   ├── db/             # Engine, sessions, Alembic base
 │   └── main.py         # FastAPI app + rate limiter
 ├── alembic/            # Schema migrations
-├── tests/              # Unit, integration, and eager-mode task tests
+├── tests/              # Unit, API/DB integration, and task tests
 ├── docker-compose.yml
 └── README.md
 ```
 
 ## Running Tests
 
-Tests run Celery tasks **in-process** (`task_always_eager=True`), so CI needs no broker or worker:
+Tests use SQLite and Celery's `.apply()` (which always runs a task synchronously in-process), so they need **no Docker, Postgres, or broker at all**:
 
 ```bash
-docker compose exec api pytest -v
+pip install -r requirements-dev.txt
+pytest -v
 ```
 
-Coverage includes input validation edge cases (negative amounts, unknown currencies), idempotency race handling, and refund state guards.
+Coverage includes input validation edge cases (negative amounts, unknown currencies), a real multi-threaded idempotency-key race, and refund state guards (including a genuine concurrent double-refund attempt).
 
 ## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | `postgresql+psycopg2://gateway:gateway@postgres:5432/gateway` | Postgres DSN |
+| `DATABASE_URL` | `postgresql://postgres:postgres@postgres:5432/payment_db` | Postgres DSN |
 | `CELERY_BROKER_URL` | `amqp://guest:guest@rabbitmq:5672//` | RabbitMQ broker |
-| `CELERY_RESULT_BACKEND` | `db+postgresql://...` | Task result storage |
+| `CELERY_RESULT_BACKEND` | `db+postgresql://postgres:postgres@postgres:5432/payment_db` | Task result storage |
 | `FRAUD_AMOUNT_THRESHOLD` | `50000` | Amount above which payments are flagged |
+| `FRAUD_VELOCITY_LIMIT` | `10` | Payments/minute per merchant before the velocity rule flags |
+| `STUCK_PAYMENT_TIMEOUT_MINUTES` | `30` | How long a payment may sit in `PROCESSING` before Beat reaps it as `FAILED` |
 
 ## Roadmap
 
-- [ ] Multi-currency support with conversion rates
-- [ ] Partial refunds
+- [ ] Merchant onboarding endpoint (merchants are currently seeded directly in the DB)
+- [ ] Multi-currency conversion rates (currency is validated but not converted)
 - [ ] Merchant-level API keys / auth
 - [ ] Dead-letter queue handling for permanently failed messages
 
