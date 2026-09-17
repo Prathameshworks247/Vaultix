@@ -4,9 +4,10 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.core.auth import require_merchant
 from app.core.logging import bind_payment_id
 from app.db.session import get_db
-from app.models.payments import Payment, PaymentEvent, PaymentStatus, Refund
+from app.models.payments import Merchant, Payment, PaymentEvent, PaymentStatus, Refund
 from app.schemas.refunds import RefundCreate, RefundOut
 from app.tasks.refund_tasks import process_refund
 
@@ -16,8 +17,13 @@ router = APIRouter(prefix="/payments", tags=["refunds"])
 
 
 @router.post("/{payment_id}/refund", response_model=RefundOut, status_code=202)
-def create_refund(payment_id: UUID, body: RefundCreate, db: Session = Depends(get_db)):
-    payment = db.get(Payment, payment_id)
+def create_refund(
+    payment_id: UUID,
+    body: RefundCreate,
+    db: Session = Depends(get_db),
+    merchant: Merchant = Depends(require_merchant),
+):
+    payment = db.query(Payment).filter_by(id=payment_id, merchant_id=merchant.id).first()
     if not payment:
         raise HTTPException(404, "payment not found")
 

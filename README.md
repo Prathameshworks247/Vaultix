@@ -24,9 +24,11 @@ Payment processing is slow, unreliable, and unforgiving of mistakes. A gateway c
 
 | Feature | How it works |
 |---|---|
+| 🔑 **API-key auth** | Every merchant-scoped endpoint requires `X-API-Key`; a merchant only ever sees or acts on its own payments |
 | 💳 **Payment lifecycle** | `PENDING → PROCESSING → SUCCEEDED / FAILED → REFUNDED` state machine |
-| 🔁 **Idempotency** | `Idempotency-Key` header + DB unique constraint — retried requests never double-charge |
+| 🔁 **Idempotency** | `Idempotency-Key` header, unique per merchant — retried requests never double-charge, and two merchants can't collide on the same key string |
 | 📜 **Event sourcing (lite)** | Append-only `payment_events` audit log for every transition |
+| 💱 **Multi-currency** | INR/USD/EUR accepted; `/admin/stats` converts everything to a base currency via static, env-overridable FX rates |
 | 🐇 **Queue isolation** | Dedicated `payment`, `email`, `refund`, and `notification` queues — an email flood can never starve payment processing |
 | ⛓️ **Celery chains** | `process_payment → fraud_check → send_receipt → notify_merchant` pipeline via Celery canvas |
 | 🕵️ **Fraud detection** | Amount-threshold rule (> ₹50,000) + per-merchant velocity rule (> 10 payments/min) |
@@ -34,7 +36,8 @@ Payment processing is slow, unreliable, and unforgiving of mistakes. A gateway c
 | 💸 **Safe refunds** | Row-level locking (`SELECT ... FOR UPDATE`) + state guards prevent double refunds |
 | 🪝 **Signed webhooks** | HMAC-SHA256 payload signatures with exponential-backoff redelivery (up to 3 attempts) |
 | ⏰ **Reconciliation** | Celery Beat nightly job sweeps payments stuck in `PROCESSING` and fails them cleanly |
-| 📊 **Observability** | `/admin/stats` metrics, Celery worker introspection, structured JSON logs correlated by `payment_id`, optional Flower dashboard |
+| ☠️ **Dead-letter capture** | Any task that raises and is never recovered lands in `dead_letters` (`/admin/dead-letters`) instead of vanishing into a worker's stderr |
+| 📊 **Observability** | `/admin/stats` metrics (admin-key protected), Celery worker introspection, structured JSON logs correlated by `payment_id`, optional Flower dashboard |
 | 🚦 **Rate limiting** | Token-bucket limiting (100 req/min per client) via slowapi |
 
 ## Architecture
@@ -61,7 +64,8 @@ Client ──HTTP──▶ FastAPI (api)
 
 - **`Numeric(12, 2)`, never `Float`** — floats can't represent money exactly.
 - **UUID primary keys** — safe to expose publicly, no guessable sequential IDs.
-- **`task_acks_late=True`** — messages are acknowledged only *after* a task finishes, giving at-least-once delivery. Tasks are written to be idempotent and re-read state from the DB on every attempt.
+- **`task_acks_late=True` + `task_reject_on_worker_lost=True`** — messages are acknowledged only *after* a task finishes, and a worker that dies mid-task rejects (not silently drops) its message, giving at-least-once delivery. Tasks are written to be idempotent and re-read state from the DB on every attempt.
+- **Merchant auth derives identity from the API key, not the request body** — `POST /payments` has no `merchant_id` field; the authenticated merchant *is* the owner. No path can be tricked into acting on someone else's data by naming their UUID.
 - **Fraud flags annotate rather than block** — a flagged payment gets a `FRAUD_FLAGGED` event but continues through the pipeline, keeping the flow linear and the decision reversible.
 
 ## Quick Start
@@ -75,9 +79,9 @@ cd Vaultix
 docker compose up --build
 ```
 
-Env vars for the containers are set directly in `docker-compose.yml`, so no `.env` is needed for the Docker path — copy `.env.example` to `.env` only if you want to point local (non-Docker) tooling like Alembic or the tests at the containers' Postgres.
+Compose has defaults for everything, so this works with no `.env` file. `docker-compose.yml` reads `${VAR:-default}` for secrets (Postgres password, `ADMIN_API_KEY`, FX rates) so a real deployment can override them without editing the file — see [Deploying](#deploying) below. Copy `.env.example` to `.env` only if you want local (non-Docker) tooling like the tests to point at the containers' Postgres.
 
-This starts six services:
+This starts six services, migrating the DB automatically on `api` startup (no separate `alembic upgrade` step needed):
 
 | Service | Purpose | Port |
 |---|---|---|
@@ -88,17 +92,11 @@ This starts six services:
 | `celery_beat` | Scheduled reconciliation jobs | — |
 | `flower` | Visual Celery dashboard | `5555` |
 
-Then run migrations:
+Create a merchant to get an API key:
 
 ```bash
-docker compose exec api alembic upgrade head
-```
-
-Vaultix has no merchant-onboarding endpoint yet (see Roadmap), so seed one directly:
-
-```bash
-docker compose exec postgres psql -U postgres -d payment_db \
-  -c "INSERT INTO merchants (id, name) VALUES (gen_random_uuid(), 'Test Merchant') RETURNING id;"
+curl -X POST http://localhost:8000/merchants -H "Content-Type: application/json" -d '{"name": "Test Merchant"}'
+# → {"id": "...", "name": "Test Merchant", "api_key": "..."}   -- shown once, save it
 ```
 
 - API docs (Swagger): http://localhost:8000/docs
@@ -112,8 +110,9 @@ docker compose exec postgres psql -U postgres -d payment_db \
 ```bash
 curl -X POST http://localhost:8000/payments \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: <api-key-from-setup>" \
   -H "Idempotency-Key: order-42-attempt-1" \
-  -d '{"merchant_id": "<merchant-uuid-from-setup>", "amount": "499.00", "currency": "INR"}'
+  -d '{"amount": "499.00", "currency": "INR"}'
 ```
 
 ```json
@@ -127,12 +126,13 @@ curl -X POST http://localhost:8000/payments \
 }
 ```
 
-Send the same request again with the same `Idempotency-Key` → you get the **same payment back**, not a duplicate charge.
+The merchant is the one that authenticated, not a field you set — `merchant_id` comes from the API key, not the body. Send the same request again with the same `Idempotency-Key` → you get the **same payment back**, not a duplicate charge (unique per merchant, so another merchant reusing the same key string gets their own payment, not yours).
 
 ### 2. Watch it settle
 
 ```bash
-curl http://localhost:8000/payments/8f14e45f-ceea-467f-a9b2-7c3d0011a3c1
+curl http://localhost:8000/payments/8f14e45f-ceea-467f-a9b2-7c3d0011a3c1 \
+  -H "X-API-Key: <api-key-from-setup>"
 ```
 
 The response includes the full event history:
@@ -155,30 +155,33 @@ Processing is simulated: each payment takes 5–15s and resolves **70% success /
 
 ```bash
 curl -X POST http://localhost:8000/payments/{id}/refund \
-  -H "Content-Type: application/json" -d '{}'
+  -H "X-API-Key: <api-key-from-setup>" -H "Content-Type: application/json" -d '{}'
 # → 202 Accepted  {"id": "...", "payment_id": "...", "amount": "499.00", "status": "PENDING", ...}
 ```
 
-Omit `amount` for a full refund, or pass `{"amount": "100.00"}` for a partial one. Refunding a non-succeeded or already-refunded payment returns `409 Conflict`; only one active refund per payment is allowed.
+Omit `amount` for a full refund, or pass `{"amount": "100.00"}` for a partial one. Refunding a non-succeeded or already-refunded payment returns `409 Conflict`; a payment that isn't yours returns `404`, not a leak of its existence; only one active refund per payment is allowed.
 
 ### 4. Register a webhook
 
 ```bash
 curl -X PUT http://localhost:8000/merchants/{merchant_id}/webhook \
-  -H "Content-Type: application/json" \
+  -H "X-API-Key: <api-key-from-setup>" -H "Content-Type: application/json" \
   -d '{"url": "https://merchant.example/hooks", "secret": "s3cret"}'
 ```
 
-On settlement, Vaultix POSTs `{payment_id, status}` to your URL with `X-Webhook-Signature` (HMAC-SHA256 of `"<timestamp>.<body>"`) and `X-Webhook-Timestamp` headers. Verify it server-side with `hmac.compare_digest`. No webhook registered → falls back to a log line instead.
+`merchant_id` in the path must match the authenticated merchant (`403` otherwise) — it's there for a readable URL, not as the actual authorization. On settlement, Vaultix POSTs `{payment_id, status}` to your URL with `X-Webhook-Signature` (HMAC-SHA256 of `"<timestamp>.<body>"`) and `X-Webhook-Timestamp` headers. Verify it server-side with `hmac.compare_digest`. No webhook registered → falls back to a log line instead.
 
-### 5. Check system health
+### 5. Check system health (admin-key protected)
 
 ```bash
-curl http://localhost:8000/admin/stats
-# {"payments": {"total": 128, "by_status": {...}, "success_rate": 0.71, "failure_rate": 0.22}, "refunds": {...}}
+curl http://localhost:8000/admin/stats -H "X-Admin-Key: <ADMIN_API_KEY>"
+# {"payments": {"total": 128, "by_status": {...}, "success_rate": 0.71,
+#   "total_by_currency": {"INR": "...", "USD": "..."},
+#   "total_in_base_currency": {"currency": "INR", "amount": "..."}}, "refunds": {...}}
 
-curl http://localhost:8000/admin/queues    # per-queue backlog, read straight off the broker
-curl http://localhost:8000/admin/workers   # live worker roster via Celery inspect
+curl http://localhost:8000/admin/queues -H "X-Admin-Key: <ADMIN_API_KEY>"        # per-queue backlog, read straight off the broker
+curl http://localhost:8000/admin/workers -H "X-Admin-Key: <ADMIN_API_KEY>"       # live worker roster via Celery inspect
+curl http://localhost:8000/admin/dead-letters -H "X-Admin-Key: <ADMIN_API_KEY>" # tasks that failed and were never recovered
 ```
 
 ## Project Structure
@@ -186,11 +189,11 @@ curl http://localhost:8000/admin/workers   # live worker roster via Celery inspe
 ```
 vaultix/
 ├── app/
-│   ├── api/            # HTTP layer: payments, refunds, webhooks, admin
-│   ├── core/            # Rate limiter, structured logging (JSON, correlated by payment_id)
-│   ├── models/         # SQLAlchemy: Merchant (+ webhook_url/secret), Payment, PaymentEvent, Refund
+│   ├── api/            # HTTP layer: merchants, payments, refunds, webhooks, admin
+│   ├── core/            # API-key auth, rate limiter, structured logging (JSON, correlated by payment_id)
+│   ├── models/         # SQLAlchemy: Merchant (api_key, webhook_url/secret), Payment, PaymentEvent, Refund, DeadLetter
 │   ├── schemas/        # Pydantic request/response contracts
-│   ├── services/       # Pure business logic (fraud rules, etc.)
+│   ├── services/       # Pure business logic (fraud rules, FX conversion)
 │   ├── tasks/          # Celery app, queues, routing, all task definitions (incl. the Beat reaper)
 │   ├── db/             # Engine, sessions, Alembic base
 │   └── main.py         # FastAPI app + rate limiter
@@ -209,7 +212,7 @@ pip install -r requirements-dev.txt
 pytest -v
 ```
 
-Coverage includes input validation edge cases (negative amounts, unknown currencies), a real multi-threaded idempotency-key race, and refund state guards (including a genuine concurrent double-refund attempt).
+Coverage includes input validation edge cases (negative amounts, unknown currencies), API-key auth (missing/wrong key, cross-merchant access denied on refunds and webhooks), a real multi-threaded idempotency-key race (including across two merchants sharing a key string), and refund state guards (including a genuine concurrent double-refund attempt).
 
 ## Configuration
 
@@ -218,16 +221,30 @@ Coverage includes input validation edge cases (negative amounts, unknown currenc
 | `DATABASE_URL` | `postgresql://postgres:postgres@postgres:5432/payment_db` | Postgres DSN |
 | `CELERY_BROKER_URL` | `amqp://guest:guest@rabbitmq:5672//` | RabbitMQ broker |
 | `CELERY_RESULT_BACKEND` | `db+postgresql://postgres:postgres@postgres:5432/payment_db` | Task result storage |
+| `ADMIN_API_KEY` | `admin-dev-key` (compose default) | Required header value (`X-Admin-Key`) for all `/admin/*` routes — **unset in prod means those routes 401 unconditionally**, so it must be set, never left as the dev default |
 | `FRAUD_AMOUNT_THRESHOLD` | `50000` | Amount above which payments are flagged |
 | `FRAUD_VELOCITY_LIMIT` | `10` | Payments/minute per merchant before the velocity rule flags |
 | `STUCK_PAYMENT_TIMEOUT_MINUTES` | `30` | How long a payment may sit in `PROCESSING` before Beat reaps it as `FAILED` |
+| `FX_RATE_USD_INR`, `FX_RATE_EUR_INR` | `83`, `90` | Static conversion rates used by `/admin/stats`'s base-currency total |
+| `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | `postgres` / `postgres` / `payment_db` | Override for a real deployment — never ship the defaults |
+
+## Deploying
+
+The base `docker-compose.yml` is dev-friendly (live-reload, bind-mounted source, hardcoded-but-overridable dev secrets). `docker-compose.prod.yml` is an overlay that strips that out — no reload, no bind mounts, `restart: unless-stopped`, 4 Uvicorn workers instead of 1:
+
+```bash
+# .env holds the real secrets - see .env.example / the Configuration table above
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+```
+
+The image itself runs as a non-root user and migrates the DB on every start (`alembic upgrade head` before the server boots), so a fresh deploy or a new migration landing never needs a manual step.
+
+For a managed platform (Railway, Render, Fly.io, etc.) instead of raw Compose: point `DATABASE_URL` at a managed Postgres and `CELERY_BROKER_URL`/`CELERY_RESULT_BACKEND` at a managed RabbitMQ (e.g. CloudAMQP) or swap the broker for Redis, then run three processes from the same image — `api` (the Dockerfile's default `CMD`), `celery -A app.celery_app worker`, and `celery -A app.celery_app beat` — each with the same env vars.
 
 ## Roadmap
 
-- [ ] Merchant onboarding endpoint (merchants are currently seeded directly in the DB)
-- [ ] Multi-currency conversion rates (currency is validated but not converted)
-- [ ] Merchant-level API keys / auth
-- [ ] Dead-letter queue handling for permanently failed messages
+- [ ] Merchant self-service (rotate/revoke an API key; currently one-shot at creation)
+- [ ] Live FX rates (currently a static, env-overridable table)
 
 ## License
 

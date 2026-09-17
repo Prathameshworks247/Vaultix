@@ -1,10 +1,13 @@
+import logging
 import os
 from celery import Celery
 from celery.schedules import crontab
-from celery.signals import setup_logging
+from celery.signals import setup_logging, task_failure
 from kombu import Queue
 
 from app.core.logging import configure_logging
+
+logger = logging.getLogger(__name__)
 
 
 @setup_logging.connect
@@ -36,6 +39,13 @@ app.conf.task_queues = (
 
 app.conf.task_default_queue = "payment_queue"
 
+# At-least-once delivery: only ack a message after the task finishes, and if the worker
+# process itself dies mid-task, reject (not silently drop) so the message is redelivered.
+# Tasks are written to be idempotent (re-read state from the DB on every attempt) so a
+# redelivery is safe.
+app.conf.task_acks_late = True
+app.conf.task_reject_on_worker_lost = True
+
 app.conf.task_routes = {
     "tasks.process_payment": {"queue": "payment_queue"},
     "tasks.fraud_check": {"queue": "payment_queue"},
@@ -60,4 +70,27 @@ def hello_world():
     return "pong"
 
 app.autodiscover_tasks(["app"], related_name="tasks")
+
+
+@task_failure.connect
+def _capture_dead_letter(sender=None, task_id=None, exception=None, args=None, traceback=None, **kwargs):
+    # Fires for any task that raised and exhausted retries (or has none) - a bug, a DB
+    # outage, anything the task itself didn't already turn into a PaymentEvent and swallow.
+    # A dedicated DB session, not the task's own (which is already torn down by now).
+    from app.db.session import SessionLocal
+    from app.models.payments import DeadLetter
+
+    db = SessionLocal()
+    try:
+        db.add(DeadLetter(
+            task_name=sender.name if sender else "unknown",
+            task_id=task_id or "unknown",
+            args=[str(a) for a in (args or [])],
+            exception=str(exception),
+            traceback=str(traceback) if traceback else None,
+        ))
+        db.commit()
+        logger.error(f"dead-lettered task {sender.name if sender else '?'}[{task_id}]: {exception}")
+    finally:
+        db.close()
 

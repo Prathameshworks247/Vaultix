@@ -3,6 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from app.core.auth import require_merchant
 from app.core.limiter import limiter
 from app.core.logging import bind_payment_id
 from app.db.session import get_db
@@ -21,18 +22,16 @@ def create_payment(
     request: Request,
     body: PaymentCreate,
     db: Session = Depends(get_db),
+    merchant: Merchant = Depends(require_merchant),
     idempotency_key: str | None = Header(default=None),
 ):
     if idempotency_key:
-        existing = db.query(Payment).filter_by(idempotency_key=idempotency_key).first()
+        existing = db.query(Payment).filter_by(merchant_id=merchant.id, idempotency_key=idempotency_key).first()
         if existing:
             return existing
 
-    if not db.get(Merchant, body.merchant_id):
-        raise HTTPException(400, "unknown merchant_id")
-
     payment = Payment(
-        merchant_id=body.merchant_id,
+        merchant_id=merchant.id,
         amount=body.amount,
         currency=body.currency,
         idempotency_key=idempotency_key,
@@ -44,7 +43,7 @@ def create_payment(
     except IntegrityError:
         db.rollback()
         if idempotency_key:
-            return db.query(Payment).filter_by(idempotency_key=idempotency_key).one()
+            return db.query(Payment).filter_by(merchant_id=merchant.id, idempotency_key=idempotency_key).one()
         raise
     with bind_payment_id(str(payment.id)):
         logger.info(f"payment created: amount={payment.amount} {payment.currency} merchant={payment.merchant_id}")
@@ -54,8 +53,13 @@ def create_payment(
 
 @router.get("", response_model=list[PaymentOut])
 @limiter.limit("100/minute")
-def list_payments(request: Request, status: PaymentStatus | None = None, db: Session = Depends(get_db)):
-    q = db.query(Payment)
+def list_payments(
+    request: Request,
+    status: PaymentStatus | None = None,
+    db: Session = Depends(get_db),
+    merchant: Merchant = Depends(require_merchant),
+):
+    q = db.query(Payment).filter_by(merchant_id=merchant.id)
     if status:
         q = q.filter(Payment.status == status)
     return q.order_by(Payment.created_at.desc()).limit(100).all()
@@ -63,8 +67,13 @@ def list_payments(request: Request, status: PaymentStatus | None = None, db: Ses
 
 @router.get("/{payment_id}")
 @limiter.limit("100/minute")
-def get_payment(request: Request, payment_id: UUID, db: Session = Depends(get_db)):
-    p = db.get(Payment, payment_id)
+def get_payment(
+    request: Request,
+    payment_id: UUID,
+    db: Session = Depends(get_db),
+    merchant: Merchant = Depends(require_merchant),
+):
+    p = db.query(Payment).filter_by(id=payment_id, merchant_id=merchant.id).first()
     if not p:
         raise HTTPException(404, "payment not found")
     return {

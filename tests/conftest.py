@@ -16,6 +16,7 @@ if os.path.exists(_DB_PATH):
 os.environ.setdefault("DATABASE_URL", f"sqlite:///{_DB_PATH}")
 os.environ.setdefault("CELERY_BROKER_URL", "memory://")
 os.environ.setdefault("CELERY_RESULT_BACKEND", "cache+memory://")
+os.environ.setdefault("ADMIN_API_KEY", "test-admin-key")
 
 import pytest
 from fastapi.testclient import TestClient
@@ -23,6 +24,9 @@ from fastapi.testclient import TestClient
 from app.db.base import Base
 from app.db.session import SessionLocal, engine
 from app.models.payments import Merchant
+
+TEST_API_KEY = "test-merchant-key"
+ADMIN_HEADERS = {"X-Admin-Key": "test-admin-key"}
 
 
 @pytest.fixture()
@@ -38,10 +42,20 @@ def db():
 
 @pytest.fixture()
 def merchant(db):
-    m = Merchant(name="Test Merchant")
+    m = Merchant(name="Test Merchant", api_key=TEST_API_KEY)
     db.add(m)
     db.commit()
     return m
+
+
+@pytest.fixture()
+def auth_headers(merchant):
+    return {"X-API-Key": merchant.api_key}
+
+
+@pytest.fixture()
+def admin_headers():
+    return dict(ADMIN_HEADERS)
 
 
 @pytest.fixture()

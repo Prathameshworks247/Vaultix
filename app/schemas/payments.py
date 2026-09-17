@@ -7,7 +7,8 @@ from uuid import UUID
 SUPPORTED = {"INR", "USD", "EUR"}
 
 class PaymentCreate(BaseModel):
-    merchant_id: UUID
+    # merchant is derived from the X-API-Key header (see app.core.auth), not from the body -
+    # a caller can't create a payment on someone else's behalf just by naming their UUID.
     amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
     currency: str = "INR"
     

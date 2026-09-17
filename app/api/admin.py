@@ -1,13 +1,17 @@
+from decimal import Decimal
+
 from fastapi import APIRouter, Depends
 from kombu import Connection
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.celery_app import app as celery_app
+from app.core.auth import require_admin
 from app.db.session import get_db
-from app.models.payments import Payment, PaymentStatus, Refund
+from app.models.payments import DeadLetter, Payment, PaymentStatus, Refund
+from app.services import fx_service
 
-router = APIRouter(prefix="/admin", tags=["admin"])
+router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
 QUEUE_NAMES = ["payment_queue", "email_queue", "refund_queue", "notification_queue"]
 
@@ -26,6 +30,13 @@ def get_stats(db: Session = Depends(get_db)):
     success_rate = (counts["SUCCEEDED"] + counts["REFUNDED"]) / settled if settled else None
     failure_rate = counts["FAILED"] / settled if settled else None
 
+    by_currency = dict(
+        db.query(Payment.currency, func.coalesce(func.sum(Payment.amount), 0))
+        .group_by(Payment.currency)
+        .all()
+    )
+    total_in_base = sum((fx_service.to_base(amount, currency) for currency, amount in by_currency.items()), Decimal("0"))
+
     refund_total = db.query(func.count(Refund.id)).scalar()
     refund_by_status = dict(
         db.query(Refund.status, func.count(Refund.id)).group_by(Refund.status).all()
@@ -43,6 +54,8 @@ def get_stats(db: Session = Depends(get_db)):
             "settled": settled,
             "success_rate": success_rate,
             "failure_rate": failure_rate,
+            "total_by_currency": {c: str(a) for c, a in by_currency.items()},
+            "total_in_base_currency": {"currency": fx_service.BASE_CURRENCY, "amount": str(total_in_base)},
         },
         "refunds": {
             "total": refund_total,
@@ -97,3 +110,22 @@ def get_worker_status():
         for name, info in stats.items()
     ]
     return {"worker_count": len(workers), "workers": workers}
+
+
+@router.get("/dead-letters")
+def get_dead_letters(db: Session = Depends(get_db)):
+    """Tasks that raised and were never recovered - see app.celery_app._capture_dead_letter."""
+    rows = db.query(DeadLetter).order_by(DeadLetter.created_at.desc()).limit(100).all()
+    return {
+        "dead_letters": [
+            {
+                "id": r.id,
+                "task_name": r.task_name,
+                "task_id": r.task_id,
+                "args": r.args,
+                "exception": r.exception,
+                "created_at": r.created_at,
+            }
+            for r in rows
+        ]
+    }

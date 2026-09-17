@@ -1,7 +1,20 @@
+from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
 from pydantic import BaseModel, HttpUrl
+
+
+class MerchantCreate(BaseModel):
+    name: str
+
+
+class MerchantCreated(BaseModel):
+    id: UUID
+    name: str
+    api_key: str  # shown once, at creation - not retrievable afterwards
+    created_at: datetime
+    model_config = {"from_attributes": True}
 
 
 class WebhookRegister(BaseModel):
