@@ -241,6 +241,48 @@ The image itself runs as a non-root user and migrates the DB on every start (`al
 
 For a managed platform (Railway, Render, Fly.io, etc.) instead of raw Compose: point `DATABASE_URL` at a managed Postgres and `CELERY_BROKER_URL`/`CELERY_RESULT_BACKEND` at a managed RabbitMQ (e.g. CloudAMQP) or swap the broker for Redis, then run three processes from the same image — `api` (the Dockerfile's default `CMD`), `celery -A app.celery_app worker`, and `celery -A app.celery_app beat` — each with the same env vars.
 
+### Deploying to Render
+
+Render has no managed RabbitMQ, so this uses Render's own managed Postgres + Key Value (Redis) as the broker instead — no third-party signup needed. `redis` is already in `requirements.txt` for this.
+
+1. **Push to GitHub** (Render deploys from a repo, not a local build).
+
+2. **New → PostgreSQL.** Note the *Internal Database URL* Render gives you — it starts with `postgres://`; SQLAlchemy needs `postgresql://`, so change the scheme when you paste it into `DATABASE_URL` below.
+
+3. **New → Key Value** (Render's managed Redis). Note its *Internal Redis URL*.
+
+4. **New → Web Service** for the API — connect the repo, environment **Docker**, Dockerfile at the repo root. Render injects its own `$PORT` and expects the app to bind to it, so override the **Start Command** (the Dockerfile's default `CMD` hardcodes `8000`):
+   ```
+   sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+   ```
+   Health check path: `/health`. Env vars:
+   | Key | Value |
+   |---|---|
+   | `DATABASE_URL` | the Postgres URL from step 2, `postgres://` → `postgresql://` |
+   | `CELERY_BROKER_URL` | the Redis URL from step 3 |
+   | `CELERY_RESULT_BACKEND` | `db+<same DATABASE_URL as above>` |
+   | `ADMIN_API_KEY` | a strong random value |
+   | `FX_RATE_USD_INR`, `FX_RATE_EUR_INR` | optional, defaults are fine |
+
+5. **New → Background Worker**, same repo/Dockerfile/env vars as step 4, Start Command:
+   ```
+   celery -A app.celery_app worker --loglevel=info
+   ```
+
+6. **New → Background Worker** again for Beat, same env vars, Start Command:
+   ```
+   celery -A app.celery_app beat --loglevel=info
+   ```
+   (Flower is optional — skip it, or add it as its own Web Service with `celery -A app.celery_app flower --port=$PORT`.)
+
+7. Once the API service is live, create your first merchant against its public URL:
+   ```bash
+   curl -X POST https://<your-render-api>.onrender.com/merchants \
+     -H "Content-Type: application/json" -d '{"name": "Acme Corp"}'
+   ```
+
+Redeploys happen automatically on push once auto-deploy is on for each service (Render's own equivalent of the GitHub Actions workflow above — you don't need both).
+
 ### CI/CD
 
 `.github/workflows/deploy.yml` SSHes into a server and redeploys on every push to `main` (or manually via the Actions tab): `git pull` → `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build` → prunes dangling images → hits `/health` and fails the run if it doesn't come back up. It assumes the repo is already `git clone`d on the server once, with a working `.env` in place (see above) — the workflow only pulls and rebuilds, it doesn't bootstrap a fresh host.
