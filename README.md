@@ -283,6 +283,54 @@ Render has no managed RabbitMQ, so this uses Render's own managed Postgres + Key
 
 Redeploys happen automatically on push once auto-deploy is on for each service (Render's own equivalent of the GitHub Actions workflow above — you don't need both).
 
+### Deploying to Fly.io
+
+The only realistically free option where the background worker and Beat actually run, not just the API — Fly's free allowance covers a few small always-on machines, which is enough for `api` + `worker` + `beat` at this scale. ("Free" here means Fly's current small usage credit + free machine allowance for new accounts, not an unconditional free tier forever — check Fly's current pricing page before relying on this long-term.) `fly.toml` in this repo already defines all three as process groups sharing one image.
+
+1. **Install flyctl and log in:**
+   ```bash
+   curl -L https://fly.io/install.sh | sh
+   fly auth login
+   ```
+
+2. **Launch (from the repo root):**
+   ```bash
+   fly launch --no-deploy
+   ```
+   It detects the Dockerfile and this repo's `fly.toml` — say no to overwriting `fly.toml`, pick a region, and decline auto-deploy (we need secrets set first).
+
+3. **Provision Postgres and attach it** (this sets the `DATABASE_URL` secret for you, already in the right `postgresql://` scheme — no manual fixup needed like Render):
+   ```bash
+   fly postgres create --name vaultix-db
+   fly postgres attach vaultix-db
+   ```
+
+4. **Get a free Redis broker from [Upstash](https://upstash.com)** (their free tier persists, unlike Fly's Postgres-adjacent one) — create a database, copy its `rediss://` connection string.
+
+5. **Set the remaining secrets:**
+   ```bash
+   fly secrets set \
+     CELERY_BROKER_URL="rediss://<your-upstash-url>" \
+     CELERY_RESULT_BACKEND="db+$(fly secrets list | grep DATABASE_URL)" \
+     ADMIN_API_KEY="<strong-random-value>"
+   ```
+   (If that `CELERY_RESULT_BACKEND` one-liner doesn't resolve cleanly, just run `fly ssh console -C 'printenv DATABASE_URL'` after the first deploy, prefix it with `db+`, and set it directly.)
+
+6. **Deploy, then scale the worker and beat process groups up from zero** (only `app` gets a machine by default):
+   ```bash
+   fly deploy
+   fly scale count 1 --process-group worker
+   fly scale count 1 --process-group beat
+   ```
+
+7. **Verify and create your first merchant:**
+   ```bash
+   curl https://vaultix.fly.dev/health
+   curl -X POST https://vaultix.fly.dev/merchants -H "Content-Type: application/json" -d '{"name": "Acme Corp"}'
+   ```
+
+Redeploy any time with `fly deploy` (or wire the GitHub Actions workflow above to run `flyctl deploy` instead of the SSH/Compose script — swap the `script:` step for `flyctl deploy --remote-only` with a `FLY_API_TOKEN` secret).
+
 ### CI/CD
 
 `.github/workflows/deploy.yml` SSHes into a server and redeploys on every push to `main` (or manually via the Actions tab): `git pull` → `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build` → prunes dangling images → hits `/health` and fails the run if it doesn't come back up. It assumes the repo is already `git clone`d on the server once, with a working `.env` in place (see above) — the workflow only pulls and rebuilds, it doesn't bootstrap a fresh host.
