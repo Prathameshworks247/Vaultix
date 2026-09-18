@@ -18,10 +18,24 @@ def _configure_worker_logging(**kwargs):
     configure_logging()
 
 
+def _normalize_result_backend(url: str | None) -> str | None:
+    """A managed-Postgres env var (Render's fromDatabase, Heroku, etc.) hands over a bare
+    "postgres://..." or "postgresql://..." connection string - Celery's DB result backend
+    needs a "db+" scheme prefix, and SQLAlchemy needs "postgresql", not "postgres". Normalize
+    both so the same DATABASE_URL-shaped value works here without hand-editing per deploy."""
+    if not url:
+        return url
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    if url.startswith("postgresql://") and not url.startswith("db+"):
+        url = "db+" + url
+    return url
+
+
 app = Celery(
     "payment_gateway",
     broker=os.environ.get("CELERY_BROKER_URL", "amqp://guest:guest@localhost:5672//"),
-    backend=os.environ.get("CELERY_RESULT_BACKEND"),
+    backend=_normalize_result_backend(os.environ.get("CELERY_RESULT_BACKEND")),
     include=[
         "app.tasks.payment_tasks",
         "app.tasks.email_tasks",

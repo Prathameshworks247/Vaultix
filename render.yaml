@@ -1,0 +1,74 @@
+# Render Blueprint - in the Render dashboard: New + -> Blueprint -> connect this repo.
+# Render reads this file and provisions everything below in one go.
+#
+# Free-tier limitation: Background Workers aren't available on Render's free plan, so
+# `celery_worker`/`celery_beat` aren't defined here - the API will accept and queue payments,
+# but nothing consumes the queue, so they stay PENDING/PROCESSING forever. Fine for showing
+# the API/docs are live; to see the full pipeline actually run, uncomment the two `worker:`
+# blocks below and change their `plan:` to a paid tier (starter or above).
+
+databases:
+  - name: vaultix-db
+    plan: free
+    databaseName: payment_db
+    user: postgres
+
+services:
+  - type: redis
+    name: vaultix-broker
+    plan: free
+    ipAllowList: []  # internal-only, no public access needed
+
+  - type: web
+    name: vaultix-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    # Render injects $PORT - the Dockerfile's default CMD hardcodes 8000, so override it here.
+    dockerCommand: >-
+      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: vaultix-db
+          property: connectionString
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: redis
+          name: vaultix-broker
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromDatabase:
+          name: vaultix-db
+          property: connectionString
+      - key: ADMIN_API_KEY
+        generateValue: true  # Render mints a random secret - view it in the dashboard env tab
+
+  # - type: worker
+  #   name: vaultix-worker
+  #   runtime: docker
+  #   dockerfilePath: ./Dockerfile
+  #   plan: starter  # Background Workers require a paid plan
+  #   dockerCommand: celery -A app.celery_app worker --loglevel=info
+  #   envVars:
+  #     - key: DATABASE_URL
+  #       fromDatabase: {name: vaultix-db, property: connectionString}
+  #     - key: CELERY_BROKER_URL
+  #       fromService: {type: redis, name: vaultix-broker, property: connectionString}
+  #     - key: CELERY_RESULT_BACKEND
+  #       fromDatabase: {name: vaultix-db, property: connectionString}
+
+  # - type: worker
+  #   name: vaultix-beat
+  #   runtime: docker
+  #   dockerfilePath: ./Dockerfile
+  #   plan: starter
+  #   dockerCommand: celery -A app.celery_app beat --loglevel=info
+  #   envVars:
+  #     - key: DATABASE_URL
+  #       fromDatabase: {name: vaultix-db, property: connectionString}
+  #     - key: CELERY_BROKER_URL
+  #       fromService: {type: redis, name: vaultix-broker, property: connectionString}
+  #     - key: CELERY_RESULT_BACKEND
+  #       fromDatabase: {name: vaultix-db, property: connectionString}
