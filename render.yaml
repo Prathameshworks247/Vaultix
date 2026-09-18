@@ -11,7 +11,7 @@ databases:
   - name: vaultix-db
     plan: free
     databaseName: payment_db
-    user: postgres
+    user: vaultix
 
 services:
   - type: redis
