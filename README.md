@@ -241,6 +241,21 @@ The image itself runs as a non-root user and migrates the DB on every start (`al
 
 For a managed platform (Railway, Render, Fly.io, etc.) instead of raw Compose: point `DATABASE_URL` at a managed Postgres and `CELERY_BROKER_URL`/`CELERY_RESULT_BACKEND` at a managed RabbitMQ (e.g. CloudAMQP) or swap the broker for Redis, then run three processes from the same image — `api` (the Dockerfile's default `CMD`), `celery -A app.celery_app worker`, and `celery -A app.celery_app beat` — each with the same env vars.
 
+### CI/CD
+
+`.github/workflows/deploy.yml` SSHes into a server and redeploys on every push to `main` (or manually via the Actions tab): `git pull` → `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build` → prunes dangling images → hits `/health` and fails the run if it doesn't come back up. It assumes the repo is already `git clone`d on the server once, with a working `.env` in place (see above) — the workflow only pulls and rebuilds, it doesn't bootstrap a fresh host.
+
+Add these as repo secrets (Settings → Secrets and variables → Actions):
+
+| Secret | Value |
+|---|---|
+| `SSH_HOST` | Server IP or hostname |
+| `SSH_USER` | SSH login user |
+| `SSH_PRIVATE_KEY` | Private key for that user (deploy key with no passphrase) |
+| `SSH_PORT` | Optional, defaults to `22` |
+| `DEPLOY_PATH` | Absolute path to the cloned repo on the server, e.g. `/home/deploy/Vaultix` |
+| `HEALTH_CHECK_URL` | Base URL the runner can reach, e.g. `http://your-server-ip:8000` |
+
 ## Roadmap
 
 - [ ] Merchant self-service (rotate/revoke an API key; currently one-shot at creation)
