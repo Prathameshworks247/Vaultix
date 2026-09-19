@@ -32,10 +32,23 @@ def _normalize_result_backend(url: str | None) -> str | None:
     return url
 
 
+def _scheme_only(url: str | None) -> str:
+    """First ~20 chars, safe to log - enough to see the scheme/prefix without leaking a
+    password that's typically right after it in a connection string."""
+    return (url or "<unset>")[:20]
+
+
+_raw_backend = os.environ.get("CELERY_RESULT_BACKEND")
+_result_backend = _normalize_result_backend(_raw_backend)
+# print(), not logger - this runs during import, before configure_logging() has taken
+# effect (it's called later in app.main, after the import chain that pulls this module in),
+# so a logger call here would silently get dropped by the default logging level.
+print(f"[celery_app] result backend: raw={_scheme_only(_raw_backend)}... normalized={_scheme_only(_result_backend)}...")
+
 app = Celery(
     "payment_gateway",
     broker=os.environ.get("CELERY_BROKER_URL", "amqp://guest:guest@localhost:5672//"),
-    backend=_normalize_result_backend(os.environ.get("CELERY_RESULT_BACKEND")),
+    backend=_result_backend,
     include=[
         "app.tasks.payment_tasks",
         "app.tasks.email_tasks",
