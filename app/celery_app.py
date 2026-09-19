@@ -45,6 +45,13 @@ _result_backend = _normalize_result_backend(_raw_backend)
 # so a logger call here would silently get dropped by the default logging level.
 print(f"[celery_app] result backend: raw={_scheme_only(_raw_backend)}... normalized={_scheme_only(_result_backend)}...")
 
+# Celery's config system re-reads os.environ["CELERY_RESULT_BACKEND"] directly on every
+# access to app.conf.result_backend - a legacy compatibility behavior that silently
+# overrides whatever's passed to Celery(backend=...) or assigned to conf.result_backend
+# afterwards. Confirmed by testing all three: only mutating the env var itself sticks.
+if _result_backend:
+    os.environ["CELERY_RESULT_BACKEND"] = _result_backend
+
 app = Celery(
     "payment_gateway",
     broker=os.environ.get("CELERY_BROKER_URL", "amqp://guest:guest@localhost:5672//"),
