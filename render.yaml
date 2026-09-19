@@ -25,9 +25,11 @@ services:
     dockerfilePath: ./Dockerfile
     plan: free
     healthCheckPath: /health
-    # Render injects $PORT - the Dockerfile's default CMD hardcodes 8000, so override it here.
-    dockerCommand: >-
-      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    # No dockerCommand override - the image's own CMD already reads ${PORT:-8000}, which
+    # Render's injected PORT satisfies. A `dockerCommand: sh -c "... && ... --port $PORT"`
+    # string here hits an env/quoting bug in how Render invokes it (confirmed: it tries to
+    # exec the whole literal string as a single command name and fails with "not found") -
+    # baking the shell logic into the Dockerfile's CMD instead sidesteps that entirely.
     envVars:
       - key: DATABASE_URL
         fromDatabase:

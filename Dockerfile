@@ -13,4 +13,6 @@ RUN useradd --create-home appuser && chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8000
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+# ${PORT:-8000} - defaults to 8000 for docker-compose/Fly (no PORT set), but Render and
+# similar platforms inject their own PORT and expect the app to bind to it.
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
